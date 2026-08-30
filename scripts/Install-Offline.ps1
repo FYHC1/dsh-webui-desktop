@@ -264,77 +264,12 @@ if (-not $SkipManager) {
     }
 }
 
-# ---------- 5b. WSL side (optional; needs bundle\wsl\ payload + wsl.exe) ----------
-$wslInstalledDistro = ''
-$wslPayload = if ($treeLayoutB) { Join-Path $TargetRoot 'wsl' } else { Join-Path $BundleDir 'wsl' }
-$wslWanted = $false
-if ($SkipWsl) {
-    Write-Host '[offline] -SkipWsl: WSL side untouched'
-} elseif ($WithWsl -or (Test-Path -LiteralPath (Join-Path $wslPayload 'install-wsl.sh') -PathType Leaf)) {
-    $wslWanted = $true
-}
-if ($wslWanted -and $sandboxHome) {
-    Write-Host '[offline] sandbox mode: WSL side skipped (real distros only)'
-    $wslWanted = $false
-}
-if ($wslWanted) {
-    if (-not (Test-Path -LiteralPath (Join-Path $wslPayload 'install-wsl.sh') -PathType Leaf)) {
-        throw '-WithWsl given but the bundle has no wsl\ payload (build with Build-Bundle.ps1 -WslPayloadDir ...).'
-    }
-    $wslExe = Join-Path $env:SystemRoot 'System32\wsl.exe'
-    if (-not (Test-Path -LiteralPath $wslExe -PathType Leaf)) {
-        if ($WithWsl) { throw 'WSL is not available on this machine (wsl.exe missing).' }
-        Write-Host '[offline] wsl.exe not found: WSL side skipped'
-        $wslWanted = $false
-    }
-}
-if ($wslWanted) {
-    function Convert-ToWslPath([string]$winPath) {
-        $full = [System.IO.Path]::GetFullPath($winPath)
-        $drive = $full.Substring(0, 1).ToLowerInvariant()
-        return '/mnt/' + $drive + ($full.Substring(2) -replace '\\', '/')
-    }
-    # Distro choice: -WslDistro > running non-helper distro > default non-helper.
-    # wsl.exe emits UTF-16; decode explicitly and strip NULs.
-    function Get-WslLines([string[]]$wslArgs) {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $wslExe
-        $psi.Arguments = ($wslArgs -join ' ')
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.StandardOutputEncoding = [System.Text.Encoding]::Unicode
-        $p = [System.Diagnostics.Process]::Start($psi)
-        $out = $p.StandardOutput.ReadToEnd()
-        $p.WaitForExit(10000) | Out-Null
-        return (@($out -replace "`0", '' -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
-    }
-    $helpers = @('docker-desktop', 'docker-desktop-data', 'rancher-desktop', 'podman-machine-default')
-    $distro = $WslDistro
-    if (-not $distro) {
-        $running = @(Get-WslLines @('-l', '--running') | Select-Object -Skip 1 | Where-Object { $h = $_ -replace ' \(.+\)$', ''; $helpers -notcontains $h })
-        $all     = @(Get-WslLines @('-l', '-q'))
-        if ($running.Count -gt 0)      { $distro = ($running[0] -replace ' \(.+\)$', '') }
-        elseif ($all.Count -gt 0)      { $distro = $all[0] }
-    }
-    if (-not $distro) {
-        if ($WithWsl) { throw 'No WSL distro found for the WSL-side install.' }
-        Write-Host '[offline] no WSL distro found: WSL side skipped'
-        $wslWanted = $false
-    } else {
-        Write-Host "[offline] WSL target distro: $distro"
-        $srcWsl = Convert-ToWslPath $wslPayload
-        $inner = 'cp "' + $srcWsl + '/install-wsl.sh" /tmp/install-wsl.sh && bash /tmp/install-wsl.sh --src "' + $srcWsl + '" --prefix "$HOME/.dsh-bundle"'
-        & $wslExe -d $distro -- bash -c $inner
-        if ($LASTEXITCODE -ne 0) {
-            throw "WSL-side install failed with exit code $LASTEXITCODE (see output above; the 'Failed to start the systemd user session' notice is a harmless WSL warning)."
-        }
-        $wslInstalledDistro = $distro
-        Write-Host "[offline] WSL side installed into '$distro' (~/.dsh-bundle + ~/.local/bin/dsh + profile + companion scripts)"
-    }
-}
-
 # ---------- 6. Config wiring: DshCommand -> bundled shim ----------
+# IMPORTANT: this runs BEFORE the WSL step so the Windows-side config is
+# always written even when the WSL install fails (the WSL step is optional).
+# If DshCommand were only set after the WSL step, a WSL failure with
+# $ErrorActionPreference=Stop would leave the config without DshCommand,
+# and the manager would not find the bundled dsh binary.
 $sharedDir = if ($sandboxHome) { Join-Path $sandboxHome '.dsh-webui' } else { Join-Path $env:USERPROFILE '.dsh-webui' }
 $configFile = Join-Path $sharedDir 'config.json'
 [System.IO.Directory]::CreateDirectory($sharedDir) | Out-Null
@@ -357,19 +292,102 @@ if (-not ($config.PSObject.Properties['DshCommand'])) {
 $cur = [string]$config.DshCommand
 if ($cur -eq '' -or $cur -like '*\dsh-bundle\*') { $config.DshCommand = $dshCmd }
 if (-not ($config.PSObject.Properties['WindowBackend'])) {
-    $config | Add-Member -MemberType NoteProperty -Name WindowBackend -Value 'auto'
-}
-# WSL side (when installed this run): remember the distro so the tray's WSL
-# backend / instance picker targets it without re-detection.
-if ($wslInstalledDistro) {
-    if (-not ($config.PSObject.Properties['WslDistro'])) {
-        $config | Add-Member -MemberType NoteProperty -Name WslDistro -Value ''
-    }
-    $curDistro = [string]$config.WslDistro
-    if ($curDistro -eq '' -or $curDistro -eq $wslInstalledDistro) { $config.WslDistro = $wslInstalledDistro }
-}
-$config | ConvertTo-Json -Depth 8 | ForEach-Object { [System.IO.File]::WriteAllText($configFile, $_, (New-Object System.Text.UTF8Encoding($false))) }
+	    $config | Add-Member -MemberType NoteProperty -Name WindowBackend -Value 'auto'
+	}
+	$config | ConvertTo-Json -Depth 8 | ForEach-Object { [System.IO.File]::WriteAllText($configFile, $_, (New-Object System.Text.UTF8Encoding($false))) }
 Write-Host "[offline] config wired: DshCommand=$($config.DshCommand) WindowBackend=$($config.WindowBackend) ($configFile)"
+
+# ---------- 5b. WSL side (optional; non-fatal) ----------
+# Runs AFTER the Windows config wiring so a WSL failure never blocks the
+# Windows-side config (DshCommand) from being written. The WSL step is
+# best-effort: failures are warnings, not fatal errors.
+$wslInstalledDistro = ''
+$wslPayload = if ($treeLayoutB) { Join-Path $TargetRoot 'wsl' } else { Join-Path $BundleDir 'wsl' }
+$wslWanted = $false
+if ($SkipWsl) {
+    Write-Host '[offline] -SkipWsl: WSL side untouched'
+} elseif ($WithWsl -or (Test-Path -LiteralPath (Join-Path $wslPayload 'install-wsl.sh') -PathType Leaf)) {
+    $wslWanted = $true
+}
+if ($wslWanted -and $sandboxHome) {
+    Write-Host '[offline] sandbox mode: WSL side skipped (real distros only)'
+    $wslWanted = $false
+}
+if ($wslWanted) {
+    if (-not (Test-Path -LiteralPath (Join-Path $wslPayload 'install-wsl.sh') -PathType Leaf)) {
+        Write-Warning '[offline] bundle has no wsl\ payload; WSL side skipped'
+        $wslWanted = $false
+    }
+}
+if ($wslWanted) {
+    $wslExe = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    if (-not (Test-Path -LiteralPath $wslExe -PathType Leaf)) {
+        if ($WithWsl) { Write-Warning '[offline] -WithWsl given but wsl.exe not found; WSL side skipped' }
+        else { Write-Host '[offline] wsl.exe not found: WSL side skipped' }
+        $wslWanted = $false
+    }
+}
+if ($wslWanted) {
+    function Convert-ToWslPath([string]$winPath) {
+        $full = [System.IO.Path]::GetFullPath($winPath)
+        $drive = $full.Substring(0, 1).ToLowerInvariant()
+        return '/mnt/' + $drive + ($full.Substring(2) -replace '\\', '/')
+    }
+    function Get-WslLines([string[]]$wslArgs) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $wslExe
+        $psi.Arguments = ($wslArgs -join ' ')
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::Unicode
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEnd()
+        $p.WaitForExit(10000) | Out-Null
+        return (@($out -replace "`0", '' -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    }
+    $helpers = @('docker-desktop', 'docker-desktop-data', 'rancher-desktop', 'podman-machine-default')
+    $distro = $WslDistro
+    if (-not $distro) {
+        $running = @(Get-WslLines @('-l', '--running') | Select-Object -Skip 1 | Where-Object { $h = $_ -replace ' \(.+\)$', ''; $helpers -notcontains $h })
+        $all     = @(Get-WslLines @('-l', '-q'))
+        if ($running.Count -gt 0)      { $distro = ($running[0] -replace ' \(.+\)$', '') }
+        elseif ($all.Count -gt 0)      { $distro = $all[0] }
+    }
+    if (-not $distro) {
+        if ($WithWsl) { Write-Warning '[offline] -WithWsl given but no WSL distro found; WSL side skipped' }
+        else { Write-Host '[offline] no WSL distro found: WSL side skipped' }
+        $wslWanted = $false
+    } else {
+        Write-Host "[offline] WSL target distro: $distro"
+        $srcWsl = Convert-ToWslPath $wslPayload
+        $inner = 'cp "' + $srcWsl + '/install-wsl.sh" /tmp/install-wsl.sh && bash /tmp/install-wsl.sh --src "' + $srcWsl + '" --prefix "$HOME/.dsh-bundle"'
+        try {
+            & $wslExe -d $distro -- bash -c $inner
+            if ($LASTEXITCODE -eq 0) {
+                $wslInstalledDistro = $distro
+                Write-Host "[offline] WSL side installed into '$distro' (~/.dsh-bundle + ~/.local/bin/dsh + profile + companion scripts)"
+                # Remember the distro in config so the tray's WSL backend targets it.
+                if (Test-Path -LiteralPath $configFile -PathType Leaf) {
+                    try {
+                        $cfg = Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
+                        if ($cfg.PSObject.Properties['WslDistro']) {
+                            $curDistro = [string]$cfg.WslDistro
+                            if ($curDistro -eq '' -or $curDistro -eq $wslInstalledDistro) {
+                                $cfg.WslDistro = $wslInstalledDistro
+                                $cfg | ConvertTo-Json -Depth 8 | ForEach-Object { [System.IO.File]::WriteAllText($configFile, $_, (New-Object System.Text.UTF8Encoding($false))) }
+                            }
+                        }
+                    } catch { Write-Warning "[offline] could not update WslDistro in config: $($_.Exception.Message)" }
+                }
+            } else {
+                Write-Warning "[offline] WSL-side install script exited $LASTEXITCODE (the 'Failed to start the systemd user session' notice is harmless); WSL side skipped"
+            }
+        } catch {
+            Write-Warning "[offline] WSL-side install failed: $($_.Exception.Message); WSL side skipped"
+        }
+    }
+}
 
 # ---------- 7. Autostart (optional) ----------
 if ($AutoStart -and -not $sandboxHome) {

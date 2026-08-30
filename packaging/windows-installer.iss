@@ -75,10 +75,10 @@ Source: "{#BundleDir}\bundle.json"; DestDir: "{app}"
 
 [Run]
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Install-Offline.ps1"" -BundleDir ""{app}"" -WithWsl"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Install-Offline.ps1"" -BundleDir ""{app}"""; \
   WorkingDir: "{app}"; \
   Description: "{cm:LaunchProgram,dsh offline bundle}（安装到本机并启动托盘管理器）"; \
-  Flags: postinstall skipifsilent runasoriginaluser unchecked
+  Flags: postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 Filename: "powershell.exe"; \
